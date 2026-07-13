@@ -1,0 +1,111 @@
+# Riff 데스크톱 릴리스 — 공개 repo에서 실행 (GitHub Actions 무료: macOS 러너 포함)
+#
+# 구조: 이 워크플로는 비공개 소스 repo(eulsoo/Riff)를 읽기 전용 PAT로 checkout해
+# 빌드하고, 결과물을 이 repo의 릴리스로 게시한다. 소스는 일회용 러너 안에서만
+# 존재하며 게시되지 않는다. 게시는 이 repo 자신이므로 GITHUB_TOKEN으로 충분.
+#
+# 실행 방법 (비공개 repo에서 버전 범프·커밋 후):
+#   gh workflow run desktop-release.yml -R eulsoo/riff-desktop-releases \
+#     -f version=0.9.0 -f ref=feature/electron-desktop
+#   (또는 GitHub 웹 → Actions → Desktop Release → Run workflow)
+#
+# 필요한 이 repo의 시크릿:
+#   SRC_CHECKOUT_TOKEN              - eulsoo/Riff 읽기 전용 fine-grained PAT (Contents: Read)
+#   CSC_LINK / CSC_KEY_PASSWORD     - Developer ID Application 인증서(.p12 base64 / 암호)
+#   APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID - notarization
+#   DESKTOP_VITE_SUPABASE_URL / DESKTOP_VITE_SUPABASE_ANON_KEY - 렌더러가 접속할 Supabase
+name: Desktop Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '릴리스 버전 (desktop/package.json과 일치해야 함, 예: 0.9.0)'
+        required: true
+      ref:
+        description: '빌드할 eulsoo/Riff의 브랜치/태그/커밋'
+        required: true
+        default: 'main'
+
+permissions:
+  contents: write   # 이 repo에 릴리스 생성
+
+jobs:
+  # 매트릭스 잡 2개가 동시에 초안을 만들면 같은 태그로 초안이 2개 생기는 레이스가
+  # 있으므로 초안을 먼저 하나 만들어둔다.
+  prepare-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 릴리스 초안 선생성 (이미 있으면 통과)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ inputs.version }}"
+          gh release view "v$VERSION" -R ${{ github.repository }} >/dev/null 2>&1 || \
+            gh release create "v$VERSION" -R ${{ github.repository }} \
+              --draft --title "$VERSION" --notes "Riff Desktop $VERSION"
+
+  release:
+    needs: prepare-release
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    # 공개 repo라 무료지만, notarization 행 등으로 잡이 매달리는 것 자체를 방지
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: 비공개 소스 checkout (eulsoo/Riff)
+        uses: actions/checkout@v4
+        with:
+          repository: eulsoo/Riff
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SRC_CHECKOUT_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            desktop/package-lock.json
+
+      - name: 입력 버전과 desktop/package.json 버전 일치 확인
+        run: |
+          PKG_VERSION=$(node -p "require('./desktop/package.json').version")
+          if [ "$PKG_VERSION" != "${{ inputs.version }}" ]; then
+            echo "::error::입력(${{ inputs.version }})과 desktop/package.json($PKG_VERSION) 버전 불일치"
+            exit 1
+          fi
+
+      - name: 루트(웹) 의존성 설치
+        run: npm ci
+
+      - name: 데스크톱 의존성 설치
+        run: npm ci --prefix desktop
+
+      - name: 렌더러 빌드 (루트 vite)
+        run: npm run build
+        env:
+          RIFF_PLATFORM: desktop
+          VITE_SUPABASE_URL: ${{ secrets.DESKTOP_VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.DESKTOP_VITE_SUPABASE_ANON_KEY }}
+
+      - name: 메인/프리로드 빌드 (electron-vite)
+        run: npm run build --prefix desktop
+
+      - name: 패키징·서명·게시 (electron-builder)
+        run: npx electron-builder --publish always
+        working-directory: desktop
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # macOS 서명·notarize (windows 잡에서는 빈 값 → electron-builder가 무시)
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
