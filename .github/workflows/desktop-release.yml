@@ -98,6 +98,10 @@ jobs:
       - name: 메인/프리로드 빌드 (electron-vite)
         run: npm run build --prefix desktop
 
+      - name: EventKit 헬퍼 빌드 (macOS 전용)
+        if: runner.os == 'macOS'
+        run: bash desktop/scripts/build-eventkit.sh
+
       - name: 패키징·서명·게시 (electron-builder)
         run: npx electron-builder --publish always
         working-directory: desktop
